@@ -1,0 +1,171 @@
+---
+title: "Bigdata_Milestone"
+author: "Team Aberdeen"
+output:
+  html_document: default
+  pdf_document: default
+data: Summer 2017
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+##libraries used
+
+```{r libraries}
+library(tidyverse)
+library(dplyr)
+library(sqldf)
+library(cluster)
+library(ggplot2)
+library(data.table)
+```
+
+## Load the data
+
+```{r}
+in_path = '/global/project/queens-mma/scene-csv/sample03/clean/'
+
+scene_mbr_dim <-fread(paste(in_path, 'scene_mbr_dim.csv', sep=""), sep=",")
+scene_mbr_acct_dim <-fread(paste(in_path, 'scene_mbr_acct_dim.csv', sep=""), sep=",")
+scene_pt_fact <-fread(paste(in_path, 'scene_pt_fact.csv', sep=""), sep=",")
+#Although, the below tables are not much helpful in the analysis, we used a few columns from the scepe_pt_tp_dim to explain out transactions
+
+scene_pt_tp_dim <-read_csv(paste(in_path, 'scene_pt_tp_dim.csv', sep=""))
+iwd_time <-read_csv(paste(in_path, 'iwd_time.csv', sep=""))
+
+head(scene_pt_tp_dim, n=10)
+head(scene_mbr_dim, n=10)
+```
+
+## Analysis 
+
+Problem statement: Cluster SCENE customers into segments by spending habits
+
+To achieve this, we will first start by using the k-means clustering on this. This will tell us how many clusters will segment the customers in the best way possible. We want to understand how location/city/point of sale location/age effects the spending of customer. The end goal is to understand the characteristics of the clusters and be able to categorize all the customers based on their points and transaction value. As of now we have done the analysis in R, however, after the milestone we will be using SparklyR to continue with our analysis
+
+We will also look at other clustering techniques such as Latent class clustering to try and analyse the probabilities of each cluster occurring. 
+
+
+#Data exploration
+
+We extensively used SQL for this and tried to pull tables based on the unique place of transaction made and what is the corresponding count as well as amount spend in each of these locations. As point of sale locations clarify where exactly the customers spend/redeem their points or make a transaction. 
+
+The table generated contained mostly point of sale at Cineplex’s and the rest being from various other locations. In this analysis, we didn’t incorporate the name wise description of the unique point of sale location but instead we took a count of all the distinct locations visited by each customer, this will be shown in the next step. 
+
+
+```{r}
+uniquePOSlocation_table <- sqldf("select distinct ptd.desc, count(ptf.scene_mbr_acct_key), sum(txn_amt) from scene_pt_tp_dim ptd join scene_pt_fact ptf on ptd.scene_pt_tp_key = ptf.scene_pt_tp_key group by 1")
+```
+
+
+#Joining the required tables together
+
+For clustering, by looking at the data from the five given tables we used the following tables and columns for the given reason. We didn’t make use of factor analysis or principal factor analysis as of now and went with our intuition in selecting the desired variables. However, later on we will make use of these techniques and compare the results. 
+
+Scene_pt_fact: This is the most informative table for our analysis and the columns "pts", "txn_amt", and "scene_mbr_acct_key" were used. The transactions were used as sum of the total transaction made by a customer, average of total transaction made by a customer, the count of number of transactions made by the customer and the total points accumulated by customer by adding all the positives from the column "pts". The ideal assumption was to add all the negatives and create a table that says redeemed points, however, on looking at the table that didn’t seem the precise summary. 
+
+Scene_mbr_dim: This table talks about the personal details and their preferences. This table helps in understanding the characteristics and behaviours of the customers. The columns from this table act as the descriptors for the clustering. We took Scene_mbr_acct_key, brth_dt, psnl_prov_state_c, psnl_city, gndr_desc, prefrd_show_tm_desc, movie_gng_frq_ref_desc, mrtl_stat_desc, and ed_lvl_desc from here. 
+
+Scene_mbr_acct_dim: From this table only the column 'Enrollment_stat_cd'. This one tells if the customer is enrolled or not. As of now we didn’t find any significance of this column but later in our analysis we want to try and analyse the total transaction as well as the total points earned/redeemed by the customers who are no longer enrolled. 
+
+Scene_pt_tp_dim: From this table, we are making use of 'desc' and using a count on it to calculate the number of times a customer has been to an unique location. This will help to understand if customer through their period go to various places or prefer to stick to a few places.
+
+```{r}
+finaltable <- sqldf("SELECT fact.scene_mbr_acct_key as account,
+                 mdim.psnl_prov_state_cd as province,
+                 mdim.psnl_city as city,
+                 mdim.gndr_desc as gender,
+                 mdim.prefrd_show_tm_desc as pref_show_time,
+                 mdim.movie_gng_frq_ref_desc as movie_frequency,
+                 mdim.mrtl_stat_desc as marital_status,
+                 mdim.brth_dt as birth_year,
+                 mdim.ed_lvl_desc as education,
+                 case when ma.enrollment_stat_cd = 'U' then 0 else 1 end as cancel_account,
+                 sum(case when fact.txn_amt is null then 0 else 1 end) count_txn,
+                 count(distinct txn.nm) as unique_pos_locations,
+                 sum(case when fact.pt > 0 then fact.pt else 0 end)  acc_pt,
+                 sum (case when fact.pt < 0 then fact.pt else 0 end) rdm_pt,
+                 sum(fact.txn_amt) as total_txn_value,
+                 avg(fact.txn_amt) as average_txn_value
+                 
+                 
+                 FROM
+                 scene_pt_fact fact 
+                 left join scene_mbr_acct_dim ma on 
+                 fact.scene_mbr_acct_key = ma.scene_mbr_acct_key
+                 left join scene_pt_tp_dim txn on
+                 fact.scene_pt_tp_key = txn.scene_pt_tp_key
+                 left join scene_mbr_dim mdim on 
+                 fact.scene_mbr_acct_key = mdim.scene_mbr_acct_key
+                 
+                 group by 1
+                 order by 12")
+
+```
+
+##Cleaning of the joined table
+
+The columns preferred time and movie frequency has a lot of missing values which meant that it wouldn’t add any value to the analysis. Removing the redeem points column as well as it is a bit confusing in this scenario.  
+```{r}
+sqldf("select count(pref_show_time), count(movie_frequency)
+from finaltable
+where pref_show_time is not null and movie_frequency is not null")
+
+#removing it from the table
+
+Finaltrain <- finaltable[ , -c(5,6,14)]
+```
+
+There were a lot of "NA" for sum of transactions and average transactions value for the customer. For the clustering, these rows didn’t add value and thus were removed. There were a few missing values for the other columns as well and since losing a few rows didn’t effect the analysis, the missing value rows are removed from the rest of the variables as well. The missing values from the variables can interrupt the clustering process. 
+
+```{r}
+Finalview <- drop_na(Finaltrain, gender, province, city, marital_status, birth_year, education, total_txn_value)
+```
+
+#Standardizing the data
+
+The data in the final view table isn’t standardized and therefore z-score is applied on these to make it favourable to clustering. 
+
+```{r}
+scaled_final <- Finalview %>% mutate_each_(funs(scale(.) %>% as.vector),
+                 vars=c("count_txn","acc_pt", "unique_pos_locations", "total_txn_value", "average_txn_value"))
+
+```
+
+#Applying k-means
+
+As of now we estimated the appropriate clusters and are experimenting with which one could fit the best. The 8 clusters from the different ones seemed apt as of now. For further analysis, we will make use of WSS and through the elbow plot determine the clusters to be used.  
+
+```{r}
+set.seed(1000)
+
+clustfinal <- kmeans(scaled_final[,8:12], centers = 8)
+
+clustfinal
+
+```
+
+#factoring the variables
+
+Letting R know which are the descriptors to be used as factors in the clustering
+
+```{r}
+clustfinal$cluster <- as.factor(clustfinal$cluster)
+
+```
+
+#Plotting the clusters
+
+From the 8 clusters formed, we plotted ggplot with province and transaction value to see how the provinces are spread out in the clusters.  
+
+```{r}
+ggplot(scaled_final, aes(scaled_final$province, scaled_final$total_txn_value, color = clustfinal$cluster)) + geom_point()
+```
+
+From the above plots looks like cluster 7 is highly dominated and the province Ontario places a high effect in it. However, going further we will incorporate all the descriptors on the basis variables and see if there is a pattern in the spending habits of the customers. 
+
+Our goal is to be able to create a new column which labels all the customers under the clusters they belong. This will help us in analysing the percentage of customers that belong to various characteristics. From this we will derive insights that will help in mapping a story.
+
+
