@@ -1,0 +1,350 @@
+---
+output:
+  word_document: default
+  pdf_document: default
+  html_document: default
+---
+title: "MMA 865 Final Project"
+output: html_document
+date: "Summer 2017"
+author: "My Team Name"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r libraries}
+library(tidyverse)
+library(data.table)
+```
+
+
+## Load the data
+
+```{r, include=FALSE}
+in_path = '/global/project/queens-mma/scene-csv/sample03/clean/'
+
+
+scene_mbr_dim <-fread(paste(in_path, 'scene_mbr_dim.csv', sep=""), sep=",")
+scene_mbr_acct_dim <-fread(paste(in_path, 'scene_mbr_acct_dim.csv', sep=""), sep=",")
+scene_pt_fact <-fread(paste(in_path, 'scene_pt_fact.csv', sep=""), sep=",")
+
+scene_pt_tp_dim <-read_csv(paste(in_path, 'scene_pt_tp_dim.csv', sep=""))
+iwd_time <-read_csv(paste(in_path, 'iwd_time.csv', sep=""))
+
+```
+
+#Installing the required packages
+
+
+
+#Loading the required Libraries 
+
+```{r, include=FALSE}
+
+library(corrplot)
+library(sqldf)
+library(caret)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(GGally)
+library(reshape)
+library(cluster) 
+```
+
+#Analysis
+Problem Statement: Cluster SCENE Customers into segments by spending habits
+To achieve this, we will first start by using the k-means clustering algorithm. This will tell us how many clusters will segment the customers in the best way possible. We want to understand how location, city, point of sale location, and age affect the spending trends or behaviours of a given customer. The end goal is to understand the characteristics of each cluster, in order to categorize all the customers based on their Scene Points & Overall transactions. As of now we have done the analysis in R, however, after the milestone we will be using SparklyR to continue with our analysis.
+We will also look at other clustering techniques such as Latent class clustering to try and analyse the probabilities of each cluster occurring.
+
+
+#Data Exploration
+
+SQL was extensively used to explore the data. Tables were pulled based on the unique place of the transaction and its corresponding count (number of times the custmer made transactions at the same unique location). Tables were also pulled by the amount spent in each of the unique locations outlined. This was achieved by considering the point of sale locations, which clarify where exactly the customers spend/redeem their points or make a transaction.
+The table generated was primarily composed of point of sales from various Cineplex locations, while the rest were from other locations. In the analysis, we did not incorporate the name wise description of the unique point of sale locations, but instead we took a count of all the distinct locations visited by each customer. This will be described in the following section.
+
+```{r}
+
+uniquePOSlocation_table <- sqldf("select distinct ptd.desc, count(ptf.scene_mbr_acct_key), sum(txn_amt), sum(case when pt > 0 then pt else 0 end) from scene_pt_tp_dim ptd join scene_pt_fact ptf on ptd.scene_pt_tp_key = ptf.scene_pt_tp_key group by 1")
+
+#Issuance is 91% of the data which is why just the positive points are used.
+
+scene_pt_fact%>%
+  filter(txn_tp_1=="issuance")%>%
+  ggplot(mapping = aes(x=pt))+
+  geom_histogram(bins=500) + scale_x_continuous(limits = c(0, 5000))
+
+```
+
+#Tables used
+
+For clustering, by looking at the data from the five given tables, we used the following tables and columns as per the description provided. We didn't make use of factor analysis or principal factor analysis as of now and went with our intuition in selecting the desired variables. However, after the milestone we plan on exploring the usage of these techniques and compare the results.
+
+Scene_pt_fact: This is the most informative table used in our analysis. The following columns were used: "pts", "txn_amt", and "scene_mbr_acct_key". The transactions were used as sum of the total transaction made by a customer, average of total transaction made by a customer, the count of number of transactions made by the customer, and the total points accumulated by customer (by adding all the positives from the column "pts"). The ideal assumption was to add all the negatives and create a table that says redeemed points, however, after looking at the table output we realized it did not seem to provide the expected summary (redemmed points count).
+
+Scene_mbr_dim: This table provided information about the customer's personal details and their preferences. This table helps in understanding the characteristics and behaviours of the customers. The columns from this table act as the descriptors for the clustering. The variables used include: Scene_mbr_acct_key, brth_dt, psnl_prov_state_c, psnl_city, gndr_desc, prefrd_show_tm_desc, movie_gng_frq_ref_desc, mrtl_stat_desc, and ed_lvl_desc.
+
+Scene_mbr_acct_dim: From this table only the column 'Enrollment_stat_cd' was used. This column whether the customer is enrolled or not. As of now we did not find any significance from this column, but later in our analysis we want to try and analyse the total transaction as well as the total points earned/redeemed by the customers who are no longer enrolled. This would hopefully help us gain insight on the characteristics of customers that are more likley to cancel their scene card membership.
+
+Scene_pt_tp_dim: From this table, we are making use of 'desc' and using a count on it to calculate the number of times a customer has been to a unique location. This will help understand whether a customer attends various places without preference or if they attend selected places only.
+
+
+```{r, include=FALSE}
+
+finaltable <- sqldf("SELECT fact.scene_mbr_acct_key as account, 2017 - mdim.brth_dt as age,
+                    mdim.psnl_prov_state_cd as province,
+                    mdim.psnl_city as city,
+                    mdim.gndr_desc as gender,
+                    ma.scene_src_enrollment_dt as start_dt, 
+                    mdim.prefrd_show_tm_desc as pref_show_time,
+                    mdim.movie_gng_frq_ref_desc as movie_frequency,
+                    mdim.mrtl_stat_desc as marital_status,
+                    mdim.ed_lvl_desc as education,
+                    case when ma.enrollment_stat_cd = 'C' then 0 else 1 end as cancel_account,
+                    sum(case when fact.txn_amt is null then 0 else 1 end) count_txn,
+                    avg(case when fact.txn_amt is null then 0 else 1 end) avg_count_txn,
+                    count(distinct txn.nm) as unique_pos_locations,
+                    sum(case when fact.pt > 0 then fact.pt else 0 end)  acc_pt,
+                    avg(case when fact.pt > 0 then fact.pt else 0 end) avg_acc_pt,
+                    sum(fact.txn_amt) as total_txn_value,
+                    avg(fact.txn_amt) as average_txn_value
+                    
+                    
+                    FROM
+                    scene_pt_fact fact 
+                    left join scene_mbr_acct_dim ma on 
+                    fact.scene_mbr_acct_key = ma.scene_mbr_acct_key
+                    left join scene_pt_tp_dim txn on
+                    fact.scene_pt_tp_key = txn.scene_pt_tp_key
+                    left join scene_mbr_dim mdim on 
+                    fact.scene_mbr_acct_key = mdim.scene_mbr_acct_key
+                    
+                    group by 1
+                    order by 12")
+```
+
+#Converting the start date into YYYY format to calculate the no: of years, each customer has been a member of Sceneber of Scotia 
+
+```{r}
+finaltable$start_dt <- year(finaltable$start_dt)
+
+finaltable$yearsmem <- 2016 - finaltable$start_dt
+```
+
+#Cleaning of the joined table
+
+The columns for preferred time and movie frequency had more that 50% missing values. For this reason we think it would not add any value to use these in the analysis, since it would only be able to explain less than half of the data.
+
+Also, removed start_dt as "yearsmem" is created in place of that and the cancelled account column is removed as 0.5% comes under cancelled
+
+#Removing all the rows with 'NA' to improve the analysis
+
+```{r, include=FALSE}
+#removing the useless columns (movie ref, pref time, start_dt)
+Finaltrain <- finaltable[ , -c(5,7,8,11)]
+
+#removing rpws containing 'NAs'
+
+Finalview <- drop_na(Finaltrain, yearsmem, province, city, marital_status, age, education, total_txn_value, average_txn_value, avg_acc_pt, acc_pt, unique_pos_locations, count_txn, avg_count_txn)
+```
+
+#Standardizing the Data
+
+The data in the final view table is not standardized and therefore z-score is applied on these to make it favourable to clustering.
+
+```{r}
+scaled_final <- Finalview %>% mutate_each_(funs(scale(.) %>% as.vector),
+                                           vars=c("total_txn_value", "average_txn_value", "avg_acc_pt", "acc_pt", "unique_pos_locations", "count_txn", "avg_count_txn"))
+
+```
+
+#Checking for correlation
+
+The correlated variables werent removed from the analysis as we didnt want to lose any information
+
+```{r}
+corrplot.mixed(cor(scaled_final[ , c(8:14)]), upper="ellipse")
+```
+
+#Number of cluster:
+
+An elbow plot is used to analyse the number of clusters to be used for clustering and it is noticed that there is a break at the 4th point. We chose 4 clusters for our analysis
+
+```{r}
+
+wss <- (nrow(scaled_final[8:14])-1)*sum(apply(scaled_final[8:14],2,var)) 
+for (i in 2:20) wss[i] <- sum(kmeans(scaled_final[8:14], 
+                                     centers=i)$withinss)
+
+plot(1:20, wss, type="b", xlab="Number of Clusters",
+     ylab="Within groups sum of squares")
+```
+
+#K-means
+
+Applying K-means on the continous varaibles i.e. total_txn_value, average_txn_value, avg_acc_pt, acc_pt, unique_pos_locations, count_txn, and avg_count_txn. With 4 clusters to be the output. 
+
+The below shows the means across the clusters as well as the clusplot seperating the varaibles within clusters
+
+```{r}
+#k-means
+fit4<- kmeans(scaled_final[8:14], 4)
+aggregate(scaled_final[8:14],by=list(fit4$cluster),FUN=mean)
+Cluster4 <- data.frame(scaled_final[8:14], fit4$cluster)
+
+#plotting clustplot
+
+clusplot(Cluster4, fit4$cluster, color=TRUE, shade=TRUE, 
+         labels=2, lines=0)
+```
+
+#Outliers
+
+The above clusplot had outliers which are getting clustered into one cluster and which is why those were removed and the k-means was performed again. 
+
+```{r}
+scaled_train <- scaled_final[-c(139913, 128475, 60694, 149392),]
+
+#redo k-means after removing the outliers
+fit4<- kmeans(scaled_train[8:14], 4)
+aggregate(scaled_train[8:14],by=list(fit4$cluster),FUN=mean)
+Cluster4<- data.frame(scaled_train[8:14], fit4$cluster)
+
+#plotting clustplot
+
+clusplot(Cluster4, fit4$cluster, color=TRUE, shade=TRUE, labels=2, lines=0)
+```
+
+#pair wise graph
+To understand the clusters better we used plotted a pair wise graph to see the between variable clustering.
+
+```{r}
+#plotting in pairs
+
+with(iris, pairs(scaled_final[8:14], col=c(8:14)[fit4$cluster]))
+```
+
+#Re-mapping
+
+Analyzing the scaled data is hard and therefore the original data (i.e. before applying z-score) is used to explain the clusters. To keep the scaled and the original clean table on par, the outliers are removed from the original table as well
+
+```{r}
+Finalview <- Finalview[-c(139913, 128475, 60694, 149392),]
+```
+
+
+#The clusters are mapped back to the table (FinalView) in order to see which customer along with the other varaibles used belong to which cluster group. 
+
+```{r}
+#adding the cluster number column
+
+###build an empty character vector of the same lenght as total txn value
+cluster_group <- vector(mode = "double", length = length(Finalview$account))
+###creat and add the factor to the finalview data frame
+cluster_group <-fit4$cluster
+cluster <-factor (cluster_group,levels=c(1,2,3,4), labels=letters[1:4],ordered = FALSE)
+###add cluster variable into dataset 
+clustabnew<-cbind(Finalview,cluster)
+```
+
+#Plotted the box plot of all the continous varaibles to see how they vary from cluster to cluster
+
+
+```{r}
+#################### Boxplot code ######################
+##########table for all sequence variables 
+clustabnew_sv<- sqldf("SELECT count_txn,avg_count_txn,unique_pos_locations,acc_pt, avg_acc_pt,total_txn_value,average_txn_value,age,cluster
+from clustabnew")
+
+              
+###convert to data frame
+clustabnew_sv2<-as.data.frame(clustabnew_sv)
+
+
+### convert from wide to long 
+clustabnew_sv2.m <- melt(clustabnew_sv, id.vars = "cluster")
+
+qplot(cluster, value, data=clustabnew_sv2.m, geom="boxplot", colour=cluster) +
+  facet_wrap(~variable, scales="free_y") + theme(legend.position="bottom")
+
+
+###################################################
+
+```
+
+#segmenta
+To check how much percentage of each of the categories within each varaible is present in a cluster we created different tables for each of the character varaible. 
+
+
+```{r}
+provinceclus <- sqldf ("with tc as (select cluster, count(account) ctot from clustabnew group by 1)
+                       
+                       select c.cluster, province, (count(account)*1.0 / ctot) as percentage from clustabnew c join tc on c.cluster=tc.cluster group by 1,2")
+
+cityclus <- sqldf ("with tc as (select cluster, count(account) ctot from clustabnew group by 1)
+                   
+                   select c.cluster, city, (count(account)*1.0 / ctot) as percentage from clustabnew c join tc on c.cluster=tc.cluster group by 1,2")
+
+maritalclus <- sqldf("with tc as (select cluster, count(account) ctot from clustabnew group by 1)
+                     
+                     select c.cluster, marital_status, (count(account)*1.0 / ctot) as percentage from clustabnew c join tc on c.cluster=tc.cluster group by 1,2")
+
+educationclus <- sqldf("with tc as (select cluster, count(account) ctot from clustabnew group by 1)
+                       
+                       select c.cluster, education, (count(account)*1.0 / ctot) as percentage from clustabnew c join tc on c.cluster=tc.cluster group by 1,2")
+
+ageclus <- sqldf("with tc as (select cluster, count(account) ctot from clustabnew group by 1)
+                 
+                 select c.cluster, age, (count(account)*1.0 / ctot) as percentage from clustabnew c join tc on c.cluster=tc.cluster group by 1,2")
+
+```
+
+#Reshaped it to get cluster wise summary.
+
+```{r}
+#reshaping
+
+educluster <- spread(data= educationclus, key = education, value = 'percentage')
+agecluster <- spread(data= ageclus, key = age, value = 'percentage')
+provincecluster <- spread(data= provinceclus, key = province, value = 'percentage')
+maritalcluster <- spread(data= maritalclus, key = marital_status, value = 'percentage')
+citycluster <- spread(data= cityclus, key = city, value = 'percentage')
+```
+
+
+#Cluster wise values which we used to get estimates for our analysislysis. 
+
+```{r}
+#average accumulate points per cluster
+
+sqldf("select avg(acc_pt) from clustabnew where cluster = 'a'")
+sqldf("select avg(acc_pt) from clustabnew where cluster = 'b'")
+sqldf("select avg(acc_pt) from clustabnew where cluster = 'c'")
+sqldf("select avg(acc_pt) from clustabnew where cluster = 'd'")
+
+#average total transactions per cluster 
+
+sqldf("select avg(total_txn_value) from clustabnew where cluster = 'a'")
+sqldf("select avg(total_txn_value) from clustabnew where cluster = 'b'")
+sqldf("select avg(total_txn_value) from clustabnew where cluster = 'c'")
+sqldf("select avg(total_txn_value) from clustabnew where cluster = 'd'")
+
+#percentage of customers per cluster
+
+sqldf("select (count(account)*1.0/ 228839) from clustabnew where cluster = 'a'")
+sqldf("select (count(account)*1.0/ 228839) from clustabnew where cluster = 'b'")
+sqldf("select (count(account)*1.0/ 228839) from clustabnew where cluster = 'c'")
+sqldf("select (count(account)*1.0/ 228839) from clustabnew where cluster = 'd'")
+
+#avg tenure per each cluster
+
+sqldf("select avg(yearsmem) from clustabnew where cluster = 'a'")
+sqldf("select avg(yearsmem) from clustabnew where cluster = 'b'")
+sqldf("select avg(yearsmem) from clustabnew where cluster = 'c'")
+sqldf("select avg(yearsmem) from clustabnew where cluster = 'd'")
+
+```
+
